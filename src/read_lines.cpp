@@ -9,6 +9,140 @@
 
 namespace duckdb {
 
+// =============================================================================
+// Memory-bounded streaming line reader for NON-SEEKABLE sources.
+//
+// A pipe / virtual URI (shellfs, scalarfs) cannot be rewound and has no
+// reliable file size, so EOF must be detected by a 0-byte Read() rather than by
+// comparing SeekPosition() against GetFileSize() (the latter throws on a pipe,
+// which previously caused a BLANK LINE mid-stream to be misread as EOF and
+// truncate the source). This reader NEVER buffers the whole stream: it keeps a
+// fixed refill buffer plus, at most, one in-progress (partial) line carried
+// across refills. Resident memory is therefore bounded by REFILL_SIZE + the
+// length of the single longest line.
+//
+// Line endings handled: "\n", "\r\n", and bare "\r". A final line without a
+// trailing newline is emitted. Blank lines mid-stream are emitted as empty
+// content. line_number and byte_offset are tracked arithmetically;
+// Seek/SeekPosition/GetFileSize are never called on the handle.
+// =============================================================================
+struct StreamLineReader {
+	static constexpr idx_t REFILL_SIZE = 65536;
+
+	FileHandle *file = nullptr;
+	string carry;        // bytes read past the last complete line (in-progress line)
+	idx_t carry_pos;     // scan/consume cursor within `carry`
+	int64_t byte_offset; // absolute byte offset of the next line's first byte
+	bool eof;            // underlying Read() has returned 0
+	bool done;           // EOF reached AND carry fully drained
+
+	StreamLineReader() : carry_pos(0), byte_offset(0), eof(false), done(true) {
+	}
+
+	void Reset(FileHandle &handle) {
+		file = &handle;
+		carry.clear();
+		carry_pos = 0;
+		byte_offset = 0;
+		eof = false;
+		done = false;
+	}
+
+	// Pull one more REFILL_SIZE block from the stream into `carry`, compacting
+	// the already-consumed prefix first so resident memory stays bounded.
+	// Returns false when the underlying stream is exhausted (0-byte read).
+	bool Refill() {
+		if (eof) {
+			return false;
+		}
+		// Drop the consumed prefix so `carry` only holds the live partial line.
+		if (carry_pos > 0) {
+			carry.erase(0, carry_pos);
+			carry_pos = 0;
+		}
+		char buffer[REFILL_SIZE];
+		int64_t bytes_read = file->Read(buffer, REFILL_SIZE);
+		if (bytes_read <= 0) {
+			eof = true;
+			return false;
+		}
+		carry.append(buffer, static_cast<size_t>(bytes_read));
+		return true;
+	}
+
+	// Try to split one complete line out of `carry` starting at carry_pos.
+	// On success sets `line` (content including its terminator) and advances
+	// carry_pos. Returns false if no complete line is currently buffered (the
+	// caller must Refill, or flush the remainder at EOF).
+	bool TrySplitLine(string &line) {
+		idx_t i = carry_pos;
+		const idx_t n = carry.size();
+		while (i < n) {
+			char c = carry[i];
+			if (c == '\n') {
+				idx_t end = i + 1;
+				line = carry.substr(carry_pos, end - carry_pos);
+				carry_pos = end;
+				return true;
+			}
+			if (c == '\r') {
+				idx_t end = i + 1;
+				if (end < n) {
+					if (carry[end] == '\n') {
+						end++; // "\r\n"
+					}
+					line = carry.substr(carry_pos, end - carry_pos);
+					carry_pos = end;
+					return true;
+				}
+				// A trailing '\r' at the very end of the buffer is ambiguous: it
+				// could be a bare-'\r' terminator or the first half of "\r\n".
+				// If the stream is exhausted it is a terminator; otherwise defer
+				// until the next refill disambiguates.
+				if (eof) {
+					line = carry.substr(carry_pos, end - carry_pos);
+					carry_pos = end;
+					return true;
+				}
+				return false;
+			}
+			i++;
+		}
+		return false;
+	}
+
+	// Read the next logical line. Returns false once the stream is fully
+	// consumed. On true, `line` includes its terminator (if any) and `offset` is
+	// the absolute byte offset of the line's first byte.
+	bool NextLine(string &line, int64_t &offset) {
+		if (done) {
+			return false;
+		}
+		while (true) {
+			if (TrySplitLine(line)) {
+				offset = byte_offset;
+				byte_offset += static_cast<int64_t>(line.size());
+				return true;
+			}
+			if (Refill()) {
+				continue;
+			}
+			// Stream exhausted: flush any remaining bytes as the final line (a
+			// last line without a trailing newline, or a trailing bare '\r').
+			if (carry_pos < carry.size()) {
+				line = carry.substr(carry_pos);
+				offset = byte_offset;
+				byte_offset += static_cast<int64_t>(line.size());
+				carry_pos = carry.size();
+				done = true;
+				return true;
+			}
+			done = true;
+			return false;
+		}
+	}
+};
+
 struct ReadTextLinesBindData : public TableFunctionData {
 	vector<OpenFileInfo> files;
 	LineSelection line_selection;
@@ -29,9 +163,16 @@ struct ReadTextLinesGlobalState : public GlobalTableFunctionState {
 	FileSystem *fs;
 	LineSelection resolved_selection; // Per-file resolved selection (handles from-end refs)
 
+	// Non-seekable (pipe / stream) support: when the current source cannot seek,
+	// lines are produced by a memory-bounded streaming reader instead of
+	// FileHandle::ReadLine + Seek-based EOF probing. The reader state persists in
+	// global state across the chunked invocations of this scan.
+	bool current_seekable;
+	StreamLineReader stream;
+
 	ReadTextLinesGlobalState()
 	    : file_index(0), current_line_number(0), current_byte_offset(0), file_finished(true), fs(nullptr),
-	      resolved_selection(LineSelection::All()) {
+	      resolved_selection(LineSelection::All()), current_seekable(true) {
 	}
 
 	idx_t MaxThreads() const override {
@@ -173,6 +314,22 @@ static bool OpenNextFile(ReadTextLinesGlobalState &state, const ReadTextLinesBin
 			state.current_line_number = 0;
 			state.current_byte_offset = 0;
 			state.file_finished = false;
+			state.current_seekable = state.current_file->CanSeek();
+
+			if (!state.current_seekable) {
+				// Non-seekable source (pipe / virtual URI): stream lines with the
+				// memory-bounded reader. from-end references are impossible on a
+				// pure stream without buffering everything, so reject them here
+				// (forward/positive selections work).
+				if (bind_data.line_selection.HasFromEndReferences()) {
+					throw IOException("from-end line selection requires a seekable source. "
+					                  "Pipes and streams do not support Seek/SeekPosition. "
+					                  "Use only positive line numbers/ranges.");
+				}
+				state.resolved_selection = bind_data.line_selection;
+				state.stream.Reset(*state.current_file);
+				return true;
+			}
 
 			// Handle from-end references (e.g., +10 meaning 10th line from end)
 			if (bind_data.line_selection.HasFromEndReferences()) {
@@ -206,6 +363,39 @@ static void ReadTextLinesFunction(ClientContext &context, TableFunctionInput &da
 			if (!OpenNextFile(state, bind_data)) {
 				break;
 			}
+		}
+
+		// Non-seekable sources are served by the memory-bounded streaming reader:
+		// EOF is a 0-byte read, blank lines mid-stream are preserved, and a final
+		// line without a trailing newline is emitted. Reader state persists across
+		// chunks via global state.
+		if (!state.current_seekable) {
+			while (output_row < STANDARD_VECTOR_SIZE && !state.file_finished) {
+				string line;
+				int64_t line_start_offset = 0;
+				if (!state.stream.NextLine(line, line_start_offset)) {
+					state.file_finished = true;
+					break;
+				}
+
+				state.current_line_number++;
+
+				if (!state.resolved_selection.ShouldIncludeLine(state.current_line_number)) {
+					if (state.resolved_selection.PastAllRanges(state.current_line_number)) {
+						state.file_finished = true;
+						break;
+					}
+					continue;
+				}
+
+				output.data[0].SetValue(output_row, Value::BIGINT(state.current_line_number));
+				output.data[1].SetValue(output_row, Value(line));
+				output.data[2].SetValue(output_row, Value::BIGINT(line_start_offset));
+				output.data[3].SetValue(output_row, Value(state.current_file_path));
+
+				output_row++;
+			}
+			continue;
 		}
 
 		while (output_row < STANDARD_VECTOR_SIZE && !state.file_finished) {
@@ -312,9 +502,17 @@ struct ReadTextLinesLateralState : public LocalTableFunctionState {
 	LineSelection resolved_selection; // Per-file resolved selection
 	idx_t chunks_processed;
 
+	// Non-seekable (pipe / stream) support. The InOut operator is re-entered
+	// (HAVE_MORE_OUTPUT) until the current source is exhausted, so the streaming
+	// reader state (refill buffer, carry, offset, eof/done) must persist in
+	// operator state across re-invocations. Each correlated input row runs its
+	// own command and gets its own reader.
+	bool current_seekable;
+	StreamLineReader stream;
+
 	ReadTextLinesLateralState()
 	    : fs(nullptr), current_line_number(0), current_byte_offset(0), file_open(false), current_row(0),
-	      resolved_selection(LineSelection::All()), chunks_processed(0) {
+	      resolved_selection(LineSelection::All()), chunks_processed(0), current_seekable(true) {
 	}
 };
 
@@ -386,7 +584,16 @@ static OperatorResultType ReadTextLinesLateralInOut(ExecutionContext &context, T
 		// Need to open a new file?
 		if (!state.file_open) {
 			if (state.current_row >= input.size()) {
-				output.SetCardinality(output_row);
+				// All input rows for this chunk are processed. If we produced
+				// output rows in THIS invocation we must flush them first (the
+				// pipeline contract forbids returning a terminal/NEED_MORE_INPUT
+				// signal together with a non-empty output chunk); the terminal
+				// decision is then taken on the next, empty re-invocation.
+				if (output_row > 0) {
+					output.SetCardinality(output_row);
+					return OperatorResultType::HAVE_MORE_OUTPUT;
+				}
+				output.SetCardinality(0);
 				state.current_row = 0;
 				state.chunks_processed++;
 				if (input.size() == 1 && state.chunks_processed >= 1) {
@@ -412,20 +619,27 @@ static OperatorResultType ReadTextLinesLateralInOut(ExecutionContext &context, T
 				state.current_byte_offset = 0;
 				state.file_open = true;
 
-				// Lateral joins require seekable sources for correct EOF detection.
-				// Use CanSeek() rather than probing SeekPosition(): it is a
-				// side-effect-free query of the underlying file system (true for
-				// local files, false for pipes/streams) and does not perturb the
-				// read position that ReadLine() relies on below.
-				if (!state.current_file->CanSeek()) {
-					throw IOException("read_lines_lateral does not support non-seekable sources "
-					                  "(pipes, virtual URIs). Use read_lines('%s') as a table "
-					                  "function instead.",
-					                  file_path);
-				}
+				// Probe seekability via CanSeek() (side-effect-free; true for
+				// local files, false for pipes/streams) rather than perturbing
+				// the read position with SeekPosition().
+				state.current_seekable = state.current_file->CanSeek();
 
-				// Handle from-end references (e.g., +10 meaning 10th line from end)
-				if (bind_data.line_selection.HasFromEndReferences()) {
+				if (!state.current_seekable) {
+					// Non-seekable source (e.g. a per-row shellfs pipe in a
+					// correlated lateral join): stream lines with the
+					// memory-bounded reader. The reader state lives in operator
+					// state so it survives the HAVE_MORE_OUTPUT re-invocations of
+					// this operator. from-end references on a pure stream are
+					// impossible without buffering everything, so reject them.
+					if (bind_data.line_selection.HasFromEndReferences()) {
+						throw IOException("from-end line selection requires a seekable source. "
+						                  "Pipes and streams do not support Seek/SeekPosition. "
+						                  "Use only positive line numbers/ranges.");
+					}
+					state.resolved_selection = bind_data.line_selection;
+					state.stream.Reset(*state.current_file);
+				} else if (bind_data.line_selection.HasFromEndReferences()) {
+					// Handle from-end references (e.g., +10 meaning 10th line from end)
 					int64_t total_lines = CountLinesInFile(*state.current_file);
 					state.resolved_selection = bind_data.line_selection;
 					state.resolved_selection.ResolveFromEnd(total_lines);
@@ -441,62 +655,97 @@ static OperatorResultType ReadTextLinesLateralInOut(ExecutionContext &context, T
 			}
 		}
 
-		// Read lines from current file
-		while (output_row < STANDARD_VECTOR_SIZE && state.file_open) {
-			string line;
-			auto line_start_offset = state.current_byte_offset;
+		// Read lines from the current source. Non-seekable sources are served by
+		// the memory-bounded streaming reader so blank lines mid-stream and a
+		// final line without a trailing newline survive, and so the reader
+		// position persists across this operator's HAVE_MORE_OUTPUT re-invocations.
+		if (!state.current_seekable) {
+			while (output_row < STANDARD_VECTOR_SIZE && state.file_open) {
+				string line;
+				int64_t line_start_offset = 0;
+				if (!state.stream.NextLine(line, line_start_offset)) {
+					state.file_open = false;
+					state.current_row++;
+					break;
+				}
 
-			try {
-				line = state.current_file->ReadLine();
-			} catch (...) {
-				state.file_open = false;
-				state.current_row++;
-				break;
-			}
+				state.current_line_number++;
 
-			// Check for EOF
-			if (line.empty()) {
-				bool at_eof = true;
-				try {
-					auto current_pos = state.current_file->SeekPosition();
-					auto file_size = state.current_file->GetFileSize();
-					if (current_pos < file_size) {
-						at_eof = false;
+				// Check line selection
+				if (!state.resolved_selection.ShouldIncludeLine(state.current_line_number)) {
+					if (state.resolved_selection.PastAllRanges(state.current_line_number)) {
+						state.file_open = false;
+						state.current_row++;
+						break;
 					}
+					continue;
+				}
+
+				// Output the line
+				output.data[0].SetValue(output_row, Value::BIGINT(state.current_line_number));
+				output.data[1].SetValue(output_row, Value(line));
+				output.data[2].SetValue(output_row, Value::BIGINT(line_start_offset));
+				output.data[3].SetValue(output_row, Value(state.current_file_path));
+
+				output_row++;
+			}
+		} else {
+			while (output_row < STANDARD_VECTOR_SIZE && state.file_open) {
+				string line;
+				auto line_start_offset = state.current_byte_offset;
+
+				try {
+					line = state.current_file->ReadLine();
+				} catch (...) {
+					state.file_open = false;
+					state.current_row++;
+					break;
+				}
+
+				// Check for EOF
+				if (line.empty()) {
+					bool at_eof = true;
+					try {
+						auto current_pos = state.current_file->SeekPosition();
+						auto file_size = state.current_file->GetFileSize();
+						if (current_pos < file_size) {
+							at_eof = false;
+						}
+					} catch (const std::exception &) {
+						at_eof = true;
+					}
+					if (at_eof) {
+						state.file_open = false;
+						state.current_row++;
+						break;
+					}
+				}
+
+				state.current_line_number++;
+				try {
+					state.current_byte_offset = state.current_file->SeekPosition();
 				} catch (const std::exception &) {
-					at_eof = true;
+					state.current_byte_offset = line_start_offset + static_cast<int64_t>(line.size()) + 1;
 				}
-				if (at_eof) {
-					state.file_open = false;
-					state.current_row++;
-					break;
+
+				// Check line selection
+				if (!state.resolved_selection.ShouldIncludeLine(state.current_line_number)) {
+					if (state.resolved_selection.PastAllRanges(state.current_line_number)) {
+						state.file_open = false;
+						state.current_row++;
+						break;
+					}
+					continue;
 				}
+
+				// Output the line
+				output.data[0].SetValue(output_row, Value::BIGINT(state.current_line_number));
+				output.data[1].SetValue(output_row, Value(line));
+				output.data[2].SetValue(output_row, Value::BIGINT(line_start_offset));
+				output.data[3].SetValue(output_row, Value(state.current_file_path));
+
+				output_row++;
 			}
-
-			state.current_line_number++;
-			try {
-				state.current_byte_offset = state.current_file->SeekPosition();
-			} catch (const std::exception &) {
-				state.current_byte_offset = line_start_offset + static_cast<int64_t>(line.size()) + 1;
-			}
-
-			// Check line selection
-			if (!state.resolved_selection.ShouldIncludeLine(state.current_line_number)) {
-				if (state.resolved_selection.PastAllRanges(state.current_line_number)) {
-					state.file_open = false;
-					state.current_row++;
-					break;
-				}
-				continue;
-			}
-
-			// Output the line
-			output.data[0].SetValue(output_row, Value::BIGINT(state.current_line_number));
-			output.data[1].SetValue(output_row, Value(line));
-			output.data[2].SetValue(output_row, Value::BIGINT(line_start_offset));
-			output.data[3].SetValue(output_row, Value(state.current_file_path));
-
-			output_row++;
 		}
 
 		// If file closed and more rows, continue to next file
@@ -519,6 +768,15 @@ static OperatorResultType ReadTextLinesLateralInOut(ExecutionContext &context, T
 
 	// More input rows to process?
 	if (state.current_row < input.size()) {
+		return OperatorResultType::HAVE_MORE_OUTPUT;
+	}
+
+	// The current source(s) drained in this invocation. If we emitted rows we
+	// must flush them with HAVE_MORE_OUTPUT and defer the terminal signal to the
+	// next (empty) call: the pipeline asserts that FINISHED / NEED_MORE_INPUT is
+	// only returned with an empty output chunk. This matters for streaming
+	// (non-seekable) sources, which can fully drain within a single invocation.
+	if (output_row > 0) {
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
 
